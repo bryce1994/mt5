@@ -1,0 +1,322 @@
+//+------------------------------------------------------------------+
+//|                                        EMA_RSI_Scalper.mq5       |
+//|                         BTCUSD M1 快进快出 剥头皮EA               |
+//|          策略: EMA金叉/死叉 + RSI过滤 + ATR动态止盈止损            |
+//+------------------------------------------------------------------+
+#property copyright "BTC Scalper v2.0"
+#property version   "2.00"
+#property description "专为BTCUSD M1设计 | EMA8/21/50 + RSI7 + ATR动态止损"
+
+#include <Trade\Trade.mqh>
+
+//--- 均线参数
+input group "=== 均线设置 (M1 优化) ==="
+input int    InpEmaFast    = 8;      // 快速EMA周期
+input int    InpEmaSlow    = 21;     // 慢速EMA周期
+input int    InpEmaTrend   = 50;     // 趋势EMA（顺势过滤）
+
+//--- RSI参数
+input group "=== RSI设置 ==="
+input int    InpRsiPeriod   = 7;     // RSI周期（M1用短周期）
+input double InpRsiLongMin  = 45.0;  // 做多最小RSI
+input double InpRsiLongMax  = 70.0;  // 做多最大RSI（避免超买）
+input double InpRsiShortMin = 30.0;  // 做空最小RSI（避免超卖）
+input double InpRsiShortMax = 55.0;  // 做空最大RSI
+
+//--- ATR动态止损
+input group "=== ATR 动态止盈止损 ==="
+input int    InpAtrPeriod   = 14;    // ATR周期
+input double InpAtrSL       = 1.2;   // 止损 = N × ATR
+input double InpAtrTP       = 2.0;   // 止盈 = N × ATR  (盈亏比约1:1.67)
+input double InpAtrTrailDist = 1.0;  // 移动止损距离 = N × ATR
+input double InpAtrTrailStart= 0.8;  // 盈利达到 N × ATR 后激活移动止损
+
+//--- 交易管理
+input group "=== 交易管理 ==="
+input double InpLots          = 0.01;  // 手数
+input double InpMaxSpreadUSD  = 30.0;  // 最大点差(USD)，BTC正常点差$5-$20
+input int    InpCooldownBars  = 3;     // 上笔交易后冷却K线数
+input int    InpSlippage      = 100;   // 最大滑点(points)，BTC需要更大容忍
+input int    InpMagic         = 88888; // 魔法数字
+
+//--- 风险控制
+input group "=== 每日风险控制 ==="
+input bool   InpUseDailyLimit    = true;  // 启用每日亏损限制
+input double InpMaxDailyLossUSD  = 50.0;  // 每日最大亏损(USD)，超过则停止
+
+//--- 移动止损开关
+input group "=== 移动止损 ==="
+input bool   InpUseTrail = true;  // 启用ATR移动止损
+
+//--- 全局变量
+CTrade   trade;
+int      g_ema_fast_h, g_ema_slow_h, g_ema_trend_h, g_rsi_h, g_atr_h;
+double   g_ema_fast[], g_ema_slow[], g_ema_trend[], g_rsi[], g_atr[];
+datetime g_last_bar    = 0;
+int      g_cooldown    = 0;   // 冷却剩余K线数
+double   g_today_loss  = 0;   // Bug1修复：缓存今日亏损，只在新K线刷新
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    if(_Period != PERIOD_M1)
+        Print("警告：建议在M1图表运行，当前:", EnumToString(_Period));
+
+    trade.SetMagicNumber(InpMagic);
+    trade.SetDeviationInPoints(InpSlippage);
+
+    g_ema_fast_h  = iMA(_Symbol, PERIOD_CURRENT, InpEmaFast,  0, MODE_EMA, PRICE_CLOSE);
+    g_ema_slow_h  = iMA(_Symbol, PERIOD_CURRENT, InpEmaSlow,  0, MODE_EMA, PRICE_CLOSE);
+    g_ema_trend_h = iMA(_Symbol, PERIOD_CURRENT, InpEmaTrend, 0, MODE_EMA, PRICE_CLOSE);
+    g_rsi_h       = iRSI(_Symbol, PERIOD_CURRENT, InpRsiPeriod, PRICE_CLOSE);
+    g_atr_h       = iATR(_Symbol, PERIOD_CURRENT, InpAtrPeriod);
+
+    if(g_ema_fast_h  == INVALID_HANDLE || g_ema_slow_h  == INVALID_HANDLE ||
+       g_ema_trend_h == INVALID_HANDLE || g_rsi_h       == INVALID_HANDLE ||
+       g_atr_h       == INVALID_HANDLE)
+    {
+        Alert("指标句柄初始化失败！");
+        return INIT_FAILED;
+    }
+
+    ArraySetAsSeries(g_ema_fast,  true);
+    ArraySetAsSeries(g_ema_slow,  true);
+    ArraySetAsSeries(g_ema_trend, true);
+    ArraySetAsSeries(g_rsi,       true);
+    ArraySetAsSeries(g_atr,       true);
+
+    Print("BTC剥头皮EA启动 | 品种:", _Symbol, " | 周期:", EnumToString(Period()),
+          " | 手数:", InpLots, " | 每日限亏:", InpMaxDailyLossUSD, "USD");
+    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    IndicatorRelease(g_ema_fast_h);
+    IndicatorRelease(g_ema_slow_h);
+    IndicatorRelease(g_ema_trend_h);
+    IndicatorRelease(g_rsi_h);
+    IndicatorRelease(g_atr_h);
+    Comment("");
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // 读取所有指标（3根K线够判断金叉/死叉）
+    if(CopyBuffer(g_ema_fast_h,  0, 0, 3, g_ema_fast)  < 3) return;
+    if(CopyBuffer(g_ema_slow_h,  0, 0, 3, g_ema_slow)  < 3) return;
+    if(CopyBuffer(g_ema_trend_h, 0, 0, 3, g_ema_trend) < 3) return;
+    if(CopyBuffer(g_rsi_h,       0, 0, 3, g_rsi)       < 3) return;
+    if(CopyBuffer(g_atr_h,       0, 0, 3, g_atr)       < 3) return;
+
+    // 每Tick执行移动止损（实时跟踪）
+    if(InpUseTrail) ManageTrailing();
+
+    // --- 以下逻辑仅在新K线开盘执行 ---
+    datetime cur_bar = iTime(_Symbol, PERIOD_CURRENT, 0);
+    if(cur_bar == g_last_bar)
+    {
+        ShowDashboard();  // 面板仍然每Tick刷新，但不再调用GetTodayLoss
+        return;
+    }
+    g_last_bar = cur_bar;
+
+    // Bug1修复：新K线时才刷新今日亏损缓存（避免每Tick执行HistorySelect）
+    g_today_loss = GetTodayLoss();
+
+    // 面板在新K线刷新后更新
+    ShowDashboard();
+
+    // Bug3修复：使用缓存值，避免重复调用GetTodayLoss
+    if(InpUseDailyLimit && g_today_loss >= InpMaxDailyLossUSD)
+    {
+        Print("每日亏损限额触发，停止开仓 | 今日亏损: ",
+              DoubleToString(g_today_loss, 2), " USD");
+        return;
+    }
+
+    // 冷却期倒计时
+    if(g_cooldown > 0) { g_cooldown--; return; }
+
+    // 一次只允许一个仓位
+    if(HasOpenPosition()) return;
+
+    // 点差过滤（BTC以USD计算）
+    double spread_usd = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)
+                        * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    if(spread_usd > InpMaxSpreadUSD)
+    {
+        Print("点差过大 ", DoubleToString(spread_usd, 2), " USD，跳过信号");
+        return;
+    }
+
+    // === 信号计算（[1]=上根已闭合K线, [2]=上上根）===
+    double atr = g_atr[1];
+
+    // 趋势过滤：快线在趋势线上方=多头环境，下方=空头环境
+    bool trend_up   = (g_ema_fast[1] > g_ema_trend[1]);
+    bool trend_down = (g_ema_fast[1] < g_ema_trend[1]);
+
+    // EMA金叉/死叉
+    bool cross_up   = (g_ema_fast[1] >  g_ema_slow[1]) &&
+                      (g_ema_fast[2] <= g_ema_slow[2]);
+    bool cross_down = (g_ema_fast[1] <  g_ema_slow[1]) &&
+                      (g_ema_fast[2] >= g_ema_slow[2]);
+
+    // RSI区间过滤
+    bool rsi_long  = (g_rsi[1] >= InpRsiLongMin  && g_rsi[1] <= InpRsiLongMax);
+    bool rsi_short = (g_rsi[1] >= InpRsiShortMin && g_rsi[1] <= InpRsiShortMax);
+
+    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    // 做多：金叉 + RSI多头区 + 顺势（快线>趋势线）
+    if(cross_up && rsi_long && trend_up)
+    {
+        double sl = NormalizeDouble(ask - InpAtrSL * atr, digits);
+        double tp = NormalizeDouble(ask + InpAtrTP * atr, digits);
+        if(trade.Buy(InpLots, _Symbol, ask, sl, tp, "BTC_BUY"))
+        {
+            g_cooldown = InpCooldownBars;
+            Print(">>> 做多 | Ask:", ask,
+                  " | SL:", sl, "(", DoubleToString(InpAtrSL * atr, 2), "$)",
+                  " | TP:", tp, "(", DoubleToString(InpAtrTP * atr, 2), "$)",
+                  " | ATR:", DoubleToString(atr, 2),
+                  " | RSI:", DoubleToString(g_rsi[1], 1));
+        }
+    }
+    // 做空：死叉 + RSI空头区 + 顺势（快线<趋势线）
+    else if(cross_down && rsi_short && trend_down)
+    {
+        double sl = NormalizeDouble(bid + InpAtrSL * atr, digits);
+        double tp = NormalizeDouble(bid - InpAtrTP * atr, digits);
+        if(trade.Sell(InpLots, _Symbol, bid, sl, tp, "BTC_SELL"))
+        {
+            g_cooldown = InpCooldownBars;
+            Print(">>> 做空 | Bid:", bid,
+                  " | SL:", sl, "(", DoubleToString(InpAtrSL * atr, 2), "$)",
+                  " | TP:", tp, "(", DoubleToString(InpAtrTP * atr, 2), "$)",
+                  " | ATR:", DoubleToString(atr, 2),
+                  " | RSI:", DoubleToString(g_rsi[1], 1));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+// ATR移动止损（每Tick执行）
+void ManageTrailing()
+{
+    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+    // Bug2修复：直接使用OnTick顶部已更新的g_atr全局数组，无需重复CopyBuffer
+    if(ArraySize(g_atr) < 2) return;
+    double atr        = g_atr[1];
+    double trail_dist = InpAtrTrailDist  * atr;
+    double trail_act  = InpAtrTrailStart * atr;
+
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(!ticket) continue;
+        if(PositionGetString(POSITION_SYMBOL)  != _Symbol) continue;
+        if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+
+        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+        double cur_sl     = PositionGetDouble(POSITION_SL);
+        double cur_tp     = PositionGetDouble(POSITION_TP);
+        ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+        if(ptype == POSITION_TYPE_BUY)
+        {
+            double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            if((bid - open_price) < trail_act) continue;
+            double new_sl = NormalizeDouble(bid - trail_dist, digits);
+            if(new_sl > cur_sl + point)
+                trade.PositionModify(ticket, new_sl, cur_tp);
+        }
+        else if(ptype == POSITION_TYPE_SELL)
+        {
+            double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            if((open_price - ask) < trail_act) continue;
+            double new_sl = NormalizeDouble(ask + trail_dist, digits);
+            if(cur_sl == 0 || new_sl < cur_sl - point)
+                trade.PositionModify(ticket, new_sl, cur_tp);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+// 统计今日已实现亏损
+double GetTodayLoss()
+{
+    MqlDateTime mdt;
+    TimeToStruct(TimeCurrent(), mdt);
+    string today_str = StringFormat("%04d.%02d.%02d 00:00:00",
+                                    mdt.year, mdt.mon, mdt.day);
+    datetime today_start = StringToTime(today_str);
+
+    double loss = 0;
+    if(!HistorySelect(today_start, TimeCurrent())) return 0;
+
+    for(int i = 0; i < HistoryDealsTotal(); i++)
+    {
+        ulong ticket = HistoryDealGetTicket(i);
+        if(HistoryDealGetString(ticket,  DEAL_SYMBOL)  != _Symbol) continue;
+        if(HistoryDealGetInteger(ticket, DEAL_MAGIC)   != InpMagic) continue;
+        if(HistoryDealGetInteger(ticket, DEAL_ENTRY)   != DEAL_ENTRY_OUT) continue;
+
+        double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                      + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
+                      + HistoryDealGetDouble(ticket, DEAL_SWAP);
+        if(profit < 0) loss += MathAbs(profit);
+    }
+    return loss;
+}
+
+//+------------------------------------------------------------------+
+// 检查是否已有本EA持仓（全局唯一仓位）
+bool HasOpenPosition()
+{
+    for(int i = 0; i < PositionsTotal(); i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 &&
+           PositionGetString(POSITION_SYMBOL)  == _Symbol &&
+           PositionGetInteger(POSITION_MAGIC)  == InpMagic)
+            return true;
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
+// 图表面板显示
+void ShowDashboard()
+{
+    string trend_str  = (ArraySize(g_ema_fast) > 1 && ArraySize(g_ema_trend) > 1)
+                        ? ((g_ema_fast[1] > g_ema_trend[1]) ? "多头" : "空头") : "计算中";
+    string pos_str    = HasOpenPosition() ? "持仓中" : (g_cooldown > 0 ?
+                        StringFormat("冷却(%d根)", g_cooldown) : "等待信号");
+    // Bug1修复：使用缓存的g_today_loss，不在每Tick调用GetTodayLoss
+    string limit_str  = (InpUseDailyLimit && g_today_loss >= InpMaxDailyLossUSD) ?
+                        "!! 已触发限额 !!" : StringFormat("%.2f / %.2f USD", g_today_loss, InpMaxDailyLossUSD);
+
+    Comment(StringFormat(
+        "=== BTC 剥头皮 M1 ===\n"
+        "趋势方向 : %s (EMA50)\n"
+        "RSI(%d)  : %.1f\n"
+        "ATR(%d)  : %.2f USD\n"
+        "点差     : %.2f USD\n"
+        "今日亏损 : %s\n"
+        "状态     : %s",
+        trend_str,
+        InpRsiPeriod, (ArraySize(g_rsi)  > 1 ? g_rsi[1]  : 0),
+        InpAtrPeriod, (ArraySize(g_atr)  > 1 ? g_atr[1]  : 0),
+        SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT),
+        limit_str,
+        pos_str
+    ));
+}
