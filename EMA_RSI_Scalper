@@ -1,322 +1,780 @@
 //+------------------------------------------------------------------+
-//|                                        EMA_RSI_Scalper.mq5       |
-//|                         BTCUSD M1 快进快出 剥头皮EA               |
-//|          策略: EMA金叉/死叉 + RSI过滤 + ATR动态止盈止损            |
+//|                                           BRR_MultiTF_EA.mq5    |
+//|           BRR形态多周期共振策略 (5M趋势 + 1M入场)                 |
+//|   逻辑: 5M识别S/R级别 → 突破确认 → 1M等待回测 → 反转K线入场      |
 //+------------------------------------------------------------------+
-#property copyright "BTC Scalper v2.0"
+#property copyright "BRR MultiTF Strategy"
 #property version   "2.00"
-#property description "专为BTCUSD M1设计 | EMA8/21/50 + RSI7 + ATR动态止损"
+#property strict
 
 #include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
 
-//--- 均线参数
-input group "=== 均线设置 (M1 优化) ==="
-input int    InpEmaFast    = 8;      // 快速EMA周期
-input int    InpEmaSlow    = 21;     // 慢速EMA周期
-input int    InpEmaTrend   = 50;     // 趋势EMA（顺势过滤）
+//--- 输入参数
+input group "=== 多周期设置 ==="
+input ENUM_TIMEFRAMES TF_Trend      = PERIOD_M5;   // 趋势/S/R周期
+input ENUM_TIMEFRAMES TF_Entry      = PERIOD_M1;   // 入场周期
 
-//--- RSI参数
-input group "=== RSI设置 ==="
-input int    InpRsiPeriod   = 7;     // RSI周期（M1用短周期）
-input double InpRsiLongMin  = 45.0;  // 做多最小RSI
-input double InpRsiLongMax  = 70.0;  // 做多最大RSI（避免超买）
-input double InpRsiShortMin = 30.0;  // 做空最小RSI（避免超卖）
-input double InpRsiShortMax = 55.0;  // 做空最大RSI
+input group "=== 支撑阻力检测 ==="
+input int    SR_Lookback            = 60;           // 回望K线数 (5M)
+input int    SR_SwingStrength       = 3;            // 摆动点强度 (左右各N根)
+input double SR_MergePips           = 8.0;          // 合并相近级别距离(pips)
+input int    SR_MaxLevels           = 12;           // 最大保留级别数
 
-//--- ATR动态止损
-input group "=== ATR 动态止盈止损 ==="
-input int    InpAtrPeriod   = 14;    // ATR周期
-input double InpAtrSL       = 1.2;   // 止损 = N × ATR
-input double InpAtrTP       = 2.0;   // 止盈 = N × ATR  (盈亏比约1:1.67)
-input double InpAtrTrailDist = 1.0;  // 移动止损距离 = N × ATR
-input double InpAtrTrailStart= 0.8;  // 盈利达到 N × ATR 后激活移动止损
+input group "=== BRR形态参数 ==="
+input double Break_MinPips          = 5.0;          // 有效突破最小pips (K线收盘)
+input double Retest_ZonePips        = 6.0;          // 回测命中区域 ±pips
+input int    Retest_MaxBars1M       = 30;           // 回测等待最大1M K线数
+input double Reversal_MinBodyPips   = 1.5;          // 反转K线最小实体pips
 
-//--- 交易管理
-input group "=== 交易管理 ==="
-input double InpLots          = 0.01;  // 手数
-input double InpMaxSpreadUSD  = 30.0;  // 最大点差(USD)，BTC正常点差$5-$20
-input int    InpCooldownBars  = 3;     // 上笔交易后冷却K线数
-input int    InpSlippage      = 100;   // 最大滑点(points)，BTC需要更大容忍
-input int    InpMagic         = 88888; // 魔法数字
+input group "=== 5M趋势过滤 ==="
+input bool   UseEMAFilter           = true;         // 启用EMA趋势过滤
+input int    EMA_Fast               = 20;           // 快EMA周期 (5M)
+input int    EMA_Slow               = 50;           // 慢EMA周期 (5M)
+input bool   UseStructureFilter     = true;         // 启用价格结构过滤 (HH/HL 或 LH/LL)
 
-//--- 风险控制
-input group "=== 每日风险控制 ==="
-input bool   InpUseDailyLimit    = true;  // 启用每日亏损限制
-input double InpMaxDailyLossUSD  = 50.0;  // 每日最大亏损(USD)，超过则停止
+input group "=== 仓位管理 ==="
+input double RiskPercent            = 1.0;          // 单笔风险 (账户%)
+input double RR_Ratio               = 2.0;          // 盈亏比 (TP = SL × N)
+input double SL_BufferPips          = 3.0;          // 止损缓冲pips (超出S/R外侧)
+input int    MaxPositions           = 2;            // 最大同时持仓数
 
-//--- 移动止损开关
 input group "=== 移动止损 ==="
-input bool   InpUseTrail = true;  // 启用ATR移动止损
+input bool   UseBreakeven           = true;         // 盈亏平衡止损
+input double BreakevenTriggerPips   = 15.0;         // 触发盈亏平衡盈利pips
+input bool   UseTrailingStop        = false;        // 追踪止损
+input double TrailStartPips         = 20.0;         // 追踪止损启动pips
+input double TrailDistPips          = 10.0;         // 追踪距离pips
 
-//--- 全局变量
-CTrade   trade;
-int      g_ema_fast_h, g_ema_slow_h, g_ema_trend_h, g_rsi_h, g_atr_h;
-double   g_ema_fast[], g_ema_slow[], g_ema_trend[], g_rsi[], g_atr[];
-datetime g_last_bar    = 0;
-int      g_cooldown    = 0;   // 冷却剩余K线数
-double   g_today_loss  = 0;   // Bug1修复：缓存今日亏损，只在新K线刷新
+input group "=== 交易时间过滤 ==="
+input bool   UseTimeFilter          = false;        // 启用时间过滤
+input int    TradingStartHour       = 8;            // 开始交易小时 (服务器时间)
+input int    TradingEndHour         = 20;           // 结束交易小时
+
+input group "=== 显示设置 ==="
+input bool   ShowSRLines            = true;         // 显示S/R线
+input bool   ShowBRRLabels          = true;         // 显示BRR标记
+input color  ColorResistance        = clrRed;       // 阻力线颜色
+input color  ColorSupport           = clrDodgerBlue;// 支撑线颜色
+input color  ColorBroken            = clrGray;      // 已突破线颜色
+input int    MagicNumber            = 20260101;     // EA魔术号
+
+//--- 常量
+#define MAX_BRR_STATES 20
+
+//--- S/R 级别结构
+struct SRLevel {
+    double   price;
+    bool     isResistance;
+    bool     isBroken;       // 已被有效突破
+    bool     breakDirection; // true=向上突破, false=向下突破
+    datetime breakTime;
+    string   objName;
+};
+
+//--- BRR 状态跟踪
+enum BRR_PHASE {
+    BRR_IDLE    = 0,
+    BRR_WAITING = 1,   // 等待回测
+    BRR_RETESTED= 2    // 已回测，等待反转确认
+};
+
+struct BRRState {
+    BRR_PHASE phase;
+    double    levelPrice;
+    bool      isLong;          // true=做多 (突破后做回测买), false=做空
+    int       waitBars;        // 已等待K线数
+    double    bestRetestPrice; // 回测到的最优价格
+    string    labelName;
+};
+
+//--- 全局对象
+CTrade          g_trade;
+CPositionInfo   g_pos;
+
+SRLevel         g_srLevels[MAX_BRR_STATES];
+int             g_srCount     = 0;
+BRRState        g_brrStates[MAX_BRR_STATES];
+
+int             g_emaFastHdl  = INVALID_HANDLE;
+int             g_emaSlowHdl  = INVALID_HANDLE;
+double          g_emaFast[];
+double          g_emaSlow[];
+
+datetime        g_lastTrendBar = 0;
+datetime        g_lastEntryBar = 0;
+double          g_point;
+double          g_pip;
 
 //+------------------------------------------------------------------+
 int OnInit()
 {
-    if(_Period != PERIOD_M1)
-        Print("警告：建议在M1图表运行，当前:", EnumToString(_Period));
+    g_trade.SetExpertMagicNumber(MagicNumber);
+    g_trade.SetDeviationInPoints(20);
+    g_trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-    trade.SetMagicNumber(InpMagic);
-    trade.SetDeviationInPoints(InpSlippage);
+    g_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    // 处理5位报价 vs 4位报价
+    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    g_pip = (digits == 3 || digits == 5) ? g_point * 10.0 : g_point;
 
-    g_ema_fast_h  = iMA(_Symbol, PERIOD_CURRENT, InpEmaFast,  0, MODE_EMA, PRICE_CLOSE);
-    g_ema_slow_h  = iMA(_Symbol, PERIOD_CURRENT, InpEmaSlow,  0, MODE_EMA, PRICE_CLOSE);
-    g_ema_trend_h = iMA(_Symbol, PERIOD_CURRENT, InpEmaTrend, 0, MODE_EMA, PRICE_CLOSE);
-    g_rsi_h       = iRSI(_Symbol, PERIOD_CURRENT, InpRsiPeriod, PRICE_CLOSE);
-    g_atr_h       = iATR(_Symbol, PERIOD_CURRENT, InpAtrPeriod);
+    g_emaFastHdl = iMA(_Symbol, TF_Trend, EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+    g_emaSlowHdl = iMA(_Symbol, TF_Trend, EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
 
-    if(g_ema_fast_h  == INVALID_HANDLE || g_ema_slow_h  == INVALID_HANDLE ||
-       g_ema_trend_h == INVALID_HANDLE || g_rsi_h       == INVALID_HANDLE ||
-       g_atr_h       == INVALID_HANDLE)
-    {
-        Alert("指标句柄初始化失败！");
+    if(g_emaFastHdl == INVALID_HANDLE || g_emaSlowHdl == INVALID_HANDLE) {
+        Alert("BRR EA: EMA指标初始化失败!");
         return INIT_FAILED;
     }
 
-    ArraySetAsSeries(g_ema_fast,  true);
-    ArraySetAsSeries(g_ema_slow,  true);
-    ArraySetAsSeries(g_ema_trend, true);
-    ArraySetAsSeries(g_rsi,       true);
-    ArraySetAsSeries(g_atr,       true);
+    ArraySetAsSeries(g_emaFast, true);
+    ArraySetAsSeries(g_emaSlow, true);
 
-    Print("BTC剥头皮EA启动 | 品种:", _Symbol, " | 周期:", EnumToString(Period()),
-          " | 手数:", InpLots, " | 每日限亏:", InpMaxDailyLossUSD, "USD");
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        g_brrStates[i].phase = BRR_IDLE;
+        g_brrStates[i].labelName = "";
+    }
+
+    Print("BRR多周期共振EA启动 | 品种:", _Symbol,
+          " | 趋势:", EnumToString(TF_Trend),
+          " | 入场:", EnumToString(TF_Entry));
     return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    IndicatorRelease(g_ema_fast_h);
-    IndicatorRelease(g_ema_slow_h);
-    IndicatorRelease(g_ema_trend_h);
-    IndicatorRelease(g_rsi_h);
-    IndicatorRelease(g_atr_h);
-    Comment("");
+    IndicatorRelease(g_emaFastHdl);
+    IndicatorRelease(g_emaSlowHdl);
+    ObjectsDeleteAll(0, "BRR_");
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    // 读取所有指标（3根K线够判断金叉/死叉）
-    if(CopyBuffer(g_ema_fast_h,  0, 0, 3, g_ema_fast)  < 3) return;
-    if(CopyBuffer(g_ema_slow_h,  0, 0, 3, g_ema_slow)  < 3) return;
-    if(CopyBuffer(g_ema_trend_h, 0, 0, 3, g_ema_trend) < 3) return;
-    if(CopyBuffer(g_rsi_h,       0, 0, 3, g_rsi)       < 3) return;
-    if(CopyBuffer(g_atr_h,       0, 0, 3, g_atr)       < 3) return;
-
-    // 每Tick执行移动止损（实时跟踪）
-    if(InpUseTrail) ManageTrailing();
-
-    // --- 以下逻辑仅在新K线开盘执行 ---
-    datetime cur_bar = iTime(_Symbol, PERIOD_CURRENT, 0);
-    if(cur_bar == g_last_bar)
-    {
-        ShowDashboard();  // 面板仍然每Tick刷新，但不再调用GetTodayLoss
-        return;
-    }
-    g_last_bar = cur_bar;
-
-    // Bug1修复：新K线时才刷新今日亏损缓存（避免每Tick执行HistorySelect）
-    g_today_loss = GetTodayLoss();
-
-    // 面板在新K线刷新后更新
-    ShowDashboard();
-
-    // Bug3修复：使用缓存值，避免重复调用GetTodayLoss
-    if(InpUseDailyLimit && g_today_loss >= InpMaxDailyLossUSD)
-    {
-        Print("每日亏损限额触发，停止开仓 | 今日亏损: ",
-              DoubleToString(g_today_loss, 2), " USD");
+    // 时间过滤
+    if(UseTimeFilter && !IsInTradingHours()) {
+        ManageOpenPositions();
         return;
     }
 
-    // 冷却期倒计时
-    if(g_cooldown > 0) { g_cooldown--; return; }
+    datetime trendBarTime = iTime(_Symbol, TF_Trend, 0);
+    datetime entryBarTime = iTime(_Symbol, TF_Entry, 0);
 
-    // 一次只允许一个仓位
-    if(HasOpenPosition()) return;
+    bool newTrendBar = (trendBarTime != g_lastTrendBar);
+    bool newEntryBar = (entryBarTime != g_lastEntryBar);
 
-    // 点差过滤（BTC以USD计算）
-    double spread_usd = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)
-                        * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    if(spread_usd > InpMaxSpreadUSD)
-    {
-        Print("点差过大 ", DoubleToString(spread_usd, 2), " USD，跳过信号");
-        return;
+    // --- 趋势周期新K线: 更新S/R + 检查突破 ---
+    if(newTrendBar) {
+        g_lastTrendBar = trendBarTime;
+        UpdateSRLevels();
+        CheckBreakouts();
+        DrawSRLines();
     }
 
-    // === 信号计算（[1]=上根已闭合K线, [2]=上上根）===
-    double atr = g_atr[1];
-
-    // 趋势过滤：快线在趋势线上方=多头环境，下方=空头环境
-    bool trend_up   = (g_ema_fast[1] > g_ema_trend[1]);
-    bool trend_down = (g_ema_fast[1] < g_ema_trend[1]);
-
-    // EMA金叉/死叉
-    bool cross_up   = (g_ema_fast[1] >  g_ema_slow[1]) &&
-                      (g_ema_fast[2] <= g_ema_slow[2]);
-    bool cross_down = (g_ema_fast[1] <  g_ema_slow[1]) &&
-                      (g_ema_fast[2] >= g_ema_slow[2]);
-
-    // RSI区间过滤
-    bool rsi_long  = (g_rsi[1] >= InpRsiLongMin  && g_rsi[1] <= InpRsiLongMax);
-    bool rsi_short = (g_rsi[1] >= InpRsiShortMin && g_rsi[1] <= InpRsiShortMax);
-
-    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-    // 做多：金叉 + RSI多头区 + 顺势（快线>趋势线）
-    if(cross_up && rsi_long && trend_up)
-    {
-        double sl = NormalizeDouble(ask - InpAtrSL * atr, digits);
-        double tp = NormalizeDouble(ask + InpAtrTP * atr, digits);
-        if(trade.Buy(InpLots, _Symbol, ask, sl, tp, "BTC_BUY"))
-        {
-            g_cooldown = InpCooldownBars;
-            Print(">>> 做多 | Ask:", ask,
-                  " | SL:", sl, "(", DoubleToString(InpAtrSL * atr, 2), "$)",
-                  " | TP:", tp, "(", DoubleToString(InpAtrTP * atr, 2), "$)",
-                  " | ATR:", DoubleToString(atr, 2),
-                  " | RSI:", DoubleToString(g_rsi[1], 1));
-        }
+    // --- 入场周期新K线: 检查回测 + 入场信号 ---
+    if(newEntryBar) {
+        g_lastEntryBar = entryBarTime;
+        UpdateBRRWaiting();
+        CheckEntrySignals();
     }
-    // 做空：死叉 + RSI空头区 + 顺势（快线<趋势线）
-    else if(cross_down && rsi_short && trend_down)
-    {
-        double sl = NormalizeDouble(bid + InpAtrSL * atr, digits);
-        double tp = NormalizeDouble(bid - InpAtrTP * atr, digits);
-        if(trade.Sell(InpLots, _Symbol, bid, sl, tp, "BTC_SELL"))
-        {
-            g_cooldown = InpCooldownBars;
-            Print(">>> 做空 | Bid:", bid,
-                  " | SL:", sl, "(", DoubleToString(InpAtrSL * atr, 2), "$)",
-                  " | TP:", tp, "(", DoubleToString(InpAtrTP * atr, 2), "$)",
-                  " | ATR:", DoubleToString(atr, 2),
-                  " | RSI:", DoubleToString(g_rsi[1], 1));
-        }
-    }
+
+    // --- 每Tick: 仓位管理 ---
+    ManageOpenPositions();
 }
 
 //+------------------------------------------------------------------+
-// ATR移动止损（每Tick执行）
-void ManageTrailing()
+//|                     S/R 级别检测                                   |
+//+------------------------------------------------------------------+
+void UpdateSRLevels()
 {
-    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-    double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    // 清除旧对象标签
+    if(ShowSRLines) ObjectsDeleteAll(0, "BRR_SR_");
 
-    // Bug2修复：直接使用OnTick顶部已更新的g_atr全局数组，无需重复CopyBuffer
-    if(ArraySize(g_atr) < 2) return;
-    double atr        = g_atr[1];
-    double trail_dist = InpAtrTrailDist  * atr;
-    double trail_act  = InpAtrTrailStart * atr;
+    double highs[], lows[];
+    ArraySetAsSeries(highs, true);
+    ArraySetAsSeries(lows, true);
 
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(!ticket) continue;
-        if(PositionGetString(POSITION_SYMBOL)  != _Symbol) continue;
-        if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+    int needed = SR_Lookback + SR_SwingStrength + 2;
+    if(CopyHigh(_Symbol, TF_Trend, 1, needed, highs) < needed) return;
+    if(CopyLow(_Symbol,  TF_Trend, 1, needed, lows)  < needed) return;
 
-        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-        double cur_sl     = PositionGetDouble(POSITION_SL);
-        double cur_tp     = PositionGetDouble(POSITION_TP);
-        ENUM_POSITION_TYPE ptype = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    // 临时数组收集候选级别
+    double  candPrices[MAX_BRR_STATES * 2];
+    bool    candIsRes[MAX_BRR_STATES * 2];
+    int     candCount = 0;
+    double  mergeZone = SR_MergePips * g_pip;
+    double  closeNow  = iClose(_Symbol, TF_Trend, 1);
 
-        if(ptype == POSITION_TYPE_BUY)
-        {
-            double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            if((bid - open_price) < trail_act) continue;
-            double new_sl = NormalizeDouble(bid - trail_dist, digits);
-            if(new_sl > cur_sl + point)
-                trade.PositionModify(ticket, new_sl, cur_tp);
-        }
-        else if(ptype == POSITION_TYPE_SELL)
-        {
-            double ask    = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            if((open_price - ask) < trail_act) continue;
-            double new_sl = NormalizeDouble(ask + trail_dist, digits);
-            if(cur_sl == 0 || new_sl < cur_sl - point)
-                trade.PositionModify(ticket, new_sl, cur_tp);
-        }
+    // 检测摆动高点 → 阻力
+    for(int i = SR_SwingStrength; i < SR_Lookback && candCount < MAX_BRR_STATES * 2; i++) {
+        if(!IsSwingHigh(highs, i)) continue;
+        double p = highs[i];
+        if(NearAny(p, candPrices, candCount, mergeZone)) continue;
+        candPrices[candCount] = p;
+        candIsRes[candCount]  = true;
+        candCount++;
     }
+
+    // 检测摆动低点 → 支撑
+    for(int i = SR_SwingStrength; i < SR_Lookback && candCount < MAX_BRR_STATES * 2; i++) {
+        if(!IsSwingLow(lows, i)) continue;
+        double p = lows[i];
+        if(NearAny(p, candPrices, candCount, mergeZone)) continue;
+        candPrices[candCount] = p;
+        candIsRes[candCount]  = false;
+        candCount++;
+    }
+
+    // 保留距当前价最近的N个; 上限不超过 MAX_BRR_STATES
+    int keep = MathMin(candCount, MathMin(SR_MaxLevels, MAX_BRR_STATES));
+    SortByDistance(candPrices, candIsRes, candCount, closeNow);
+
+    // 保留已突破状态 (合并旧状态)
+    SRLevel newLevels[MAX_BRR_STATES];
+    int     newCount = 0;
+    for(int i = 0; i < keep; i++) {
+        newLevels[i].price        = candPrices[i];
+        newLevels[i].isResistance = candIsRes[i];
+        newLevels[i].isBroken     = false;
+        newLevels[i].objName      = "BRR_SR_" + IntegerToString(i);
+
+        // 继承旧突破状态
+        for(int j = 0; j < g_srCount; j++) {
+            if(MathAbs(g_srLevels[j].price - candPrices[i]) < mergeZone && g_srLevels[j].isBroken) {
+                newLevels[i].isBroken       = true;
+                newLevels[i].breakDirection = g_srLevels[j].breakDirection;
+                newLevels[i].breakTime      = g_srLevels[j].breakTime;
+                break;
+            }
+        }
+        newCount++;
+    }
+
+    ArrayCopy(g_srLevels, newLevels, 0, 0, newCount);
+    g_srCount = newCount;
 }
 
 //+------------------------------------------------------------------+
-// 统计今日已实现亏损
-double GetTodayLoss()
+bool IsSwingHigh(double &h[], int idx)
 {
-    MqlDateTime mdt;
-    TimeToStruct(TimeCurrent(), mdt);
-    string today_str = StringFormat("%04d.%02d.%02d 00:00:00",
-                                    mdt.year, mdt.mon, mdt.day);
-    datetime today_start = StringToTime(today_str);
-
-    double loss = 0;
-    if(!HistorySelect(today_start, TimeCurrent())) return 0;
-
-    for(int i = 0; i < HistoryDealsTotal(); i++)
-    {
-        ulong ticket = HistoryDealGetTicket(i);
-        if(HistoryDealGetString(ticket,  DEAL_SYMBOL)  != _Symbol) continue;
-        if(HistoryDealGetInteger(ticket, DEAL_MAGIC)   != InpMagic) continue;
-        if(HistoryDealGetInteger(ticket, DEAL_ENTRY)   != DEAL_ENTRY_OUT) continue;
-
-        double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT)
-                      + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
-                      + HistoryDealGetDouble(ticket, DEAL_SWAP);
-        if(profit < 0) loss += MathAbs(profit);
-    }
-    return loss;
+    for(int d = 1; d <= SR_SwingStrength; d++)
+        if(h[idx] <= h[idx - d] || h[idx] <= h[idx + d]) return false;
+    return true;
 }
-
-//+------------------------------------------------------------------+
-// 检查是否已有本EA持仓（全局唯一仓位）
-bool HasOpenPosition()
+bool IsSwingLow(double &l[], int idx)
 {
-    for(int i = 0; i < PositionsTotal(); i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket > 0 &&
-           PositionGetString(POSITION_SYMBOL)  == _Symbol &&
-           PositionGetInteger(POSITION_MAGIC)  == InpMagic)
-            return true;
-    }
+    for(int d = 1; d <= SR_SwingStrength; d++)
+        if(l[idx] >= l[idx - d] || l[idx] >= l[idx + d]) return false;
+    return true;
+}
+bool NearAny(double price, double &arr[], int cnt, double zone)
+{
+    for(int i = 0; i < cnt; i++)
+        if(MathAbs(arr[i] - price) < zone) return true;
     return false;
 }
 
-//+------------------------------------------------------------------+
-// 图表面板显示
-void ShowDashboard()
+void SortByDistance(double &prices[], bool &isRes[], int total, double ref)
 {
-    string trend_str  = (ArraySize(g_ema_fast) > 1 && ArraySize(g_ema_trend) > 1)
-                        ? ((g_ema_fast[1] > g_ema_trend[1]) ? "多头" : "空头") : "计算中";
-    string pos_str    = HasOpenPosition() ? "持仓中" : (g_cooldown > 0 ?
-                        StringFormat("冷却(%d根)", g_cooldown) : "等待信号");
-    // Bug1修复：使用缓存的g_today_loss，不在每Tick调用GetTodayLoss
-    string limit_str  = (InpUseDailyLimit && g_today_loss >= InpMaxDailyLossUSD) ?
-                        "!! 已触发限额 !!" : StringFormat("%.2f / %.2f USD", g_today_loss, InpMaxDailyLossUSD);
-
-    Comment(StringFormat(
-        "=== BTC 剥头皮 M1 ===\n"
-        "趋势方向 : %s (EMA50)\n"
-        "RSI(%d)  : %.1f\n"
-        "ATR(%d)  : %.2f USD\n"
-        "点差     : %.2f USD\n"
-        "今日亏损 : %s\n"
-        "状态     : %s",
-        trend_str,
-        InpRsiPeriod, (ArraySize(g_rsi)  > 1 ? g_rsi[1]  : 0),
-        InpAtrPeriod, (ArraySize(g_atr)  > 1 ? g_atr[1]  : 0),
-        SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) * SymbolInfoDouble(_Symbol, SYMBOL_POINT),
-        limit_str,
-        pos_str
-    ));
+    // 简单冒泡排序按距离升序
+    for(int i = 0; i < total - 1; i++) {
+        for(int j = 0; j < total - i - 1; j++) {
+            if(MathAbs(prices[j] - ref) > MathAbs(prices[j + 1] - ref)) {
+                double tmp = prices[j]; prices[j] = prices[j+1]; prices[j+1] = tmp;
+                bool   tb  = isRes[j];  isRes[j]  = isRes[j+1];  isRes[j+1]  = tb;
+            }
+        }
+    }
 }
+
+//+------------------------------------------------------------------+
+//|                     突破检测 (5M K线收盘确认)                       |
+//+------------------------------------------------------------------+
+void CheckBreakouts()
+{
+    double breakMin = Break_MinPips * g_pip;
+
+    // 使用刚完成的5M K线 (index=1)
+    double prevClose = iClose(_Symbol, TF_Trend, 1);
+
+    for(int i = 0; i < g_srCount; i++) {
+        if(g_srLevels[i].isBroken) continue;
+
+        double lvl = g_srLevels[i].price;
+
+        // 向上突破阻力
+        if(g_srLevels[i].isResistance && prevClose > lvl + breakMin) {
+            g_srLevels[i].isBroken       = true;
+            g_srLevels[i].breakDirection = true;
+            g_srLevels[i].breakTime      = TimeCurrent();
+            RegisterBRR(lvl, true);
+            PrintFormat("↑ 突破阻力 %.5f | K线收盘 %.5f", lvl, prevClose);
+        }
+        // 向下突破支撑
+        else if(!g_srLevels[i].isResistance && prevClose < lvl - breakMin) {
+            g_srLevels[i].isBroken       = true;
+            g_srLevels[i].breakDirection = false;
+            g_srLevels[i].breakTime      = TimeCurrent();
+            RegisterBRR(lvl, false);
+            PrintFormat("↓ 突破支撑 %.5f | K线收盘 %.5f", lvl, prevClose);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+void RegisterBRR(double levelPrice, bool isLong)
+{
+    // 防止重复注册同一级别
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase != BRR_IDLE &&
+           MathAbs(g_brrStates[i].levelPrice - levelPrice) < SR_MergePips * g_pip) return;
+    }
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase == BRR_IDLE) {
+            g_brrStates[i].phase      = BRR_WAITING;
+            g_brrStates[i].levelPrice = levelPrice;
+            g_brrStates[i].isLong     = isLong;
+            g_brrStates[i].waitBars   = 0;
+            g_brrStates[i].bestRetestPrice = 0;
+            g_brrStates[i].labelName  = "BRR_LBL_" + IntegerToString(i);
+            PrintFormat("BRR注册 | 级别:%.5f | 方向:%s", levelPrice, isLong ? "多" : "空");
+            return;
+        }
+    }
+    Print("BRR状态槽已满，忽略新突破");
+}
+
+//+------------------------------------------------------------------+
+//|              1M回测监测 + 趋势过滤                                  |
+//+------------------------------------------------------------------+
+void UpdateBRRWaiting()
+{
+    double retestZone = Retest_ZonePips * g_pip;
+
+    // 获取1M已完成K线 (index=1)
+    double h1 = iHigh(_Symbol,  TF_Entry, 1);
+    double l1 = iLow(_Symbol,   TF_Entry, 1);
+    double c1 = iClose(_Symbol, TF_Entry, 1);
+    double o1 = iOpen(_Symbol,  TF_Entry, 1);
+
+    // 获取5M EMA
+    bool trendBullish = true, trendBearish = true;
+    if(UseEMAFilter) {
+        if(CopyBuffer(g_emaFastHdl, 0, 0, 2, g_emaFast) < 2) return;
+        if(CopyBuffer(g_emaSlowHdl, 0, 0, 2, g_emaSlow) < 2) return;
+        trendBullish = (g_emaFast[0] > g_emaSlow[0]);
+        trendBearish = (g_emaFast[0] < g_emaSlow[0]);
+    }
+
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase != BRR_WAITING) continue;
+
+        g_brrStates[i].waitBars++;
+
+        // 超时作废
+        if(g_brrStates[i].waitBars > Retest_MaxBars1M) {
+            PrintFormat("BRR超时作废 | 级别:%.5f", g_brrStates[i].levelPrice);
+            g_brrStates[i].phase = BRR_IDLE;
+            DeleteLabel(i);
+            continue;
+        }
+        double lvl    = g_brrStates[i].levelPrice;
+        bool   isLong = g_brrStates[i].isLong;
+
+        // 趋势一致性检查
+        if(isLong  && UseEMAFilter && !trendBullish) continue;
+        if(!isLong && UseEMAFilter && !trendBearish) continue;
+
+        // 回测命中检测
+        // 做多回测: 价格回落触碰原阻力(现支撑)附近
+        bool retestHit = false;
+        if(isLong) {
+            retestHit = (l1 >= lvl - retestZone && l1 <= lvl + retestZone) ||
+                        (c1 >= lvl - retestZone && c1 <= lvl + retestZone);
+        } else {
+            retestHit = (h1 >= lvl - retestZone && h1 <= lvl + retestZone) ||
+                        (c1 >= lvl - retestZone && c1 <= lvl + retestZone);
+        }
+
+        if(retestHit) {
+            g_brrStates[i].phase    = BRR_RETESTED;
+            g_brrStates[i].waitBars = 0;   // 重置计时器, 用于 RETESTED 超时
+            g_brrStates[i].bestRetestPrice = isLong ? l1 : h1;
+            PrintFormat("回测命中 | 级别:%.5f | 方向:%s", lvl, isLong ? "多" : "空");
+            if(ShowBRRLabels) DrawBRRLabel(i, lvl, isLong, "R");
+        }
+    }
+
+    // BRR_RETESTED 超时: 同样使用 Retest_MaxBars1M, 防止过期信号长期挂起
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase != BRR_RETESTED) continue;
+        g_brrStates[i].waitBars++;
+        if(g_brrStates[i].waitBars > Retest_MaxBars1M) {
+            PrintFormat("RETESTED超时作废 | 级别:%.5f", g_brrStates[i].levelPrice);
+            g_brrStates[i].phase = BRR_IDLE;
+            DeleteLabel(i);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//|              1M反转信号确认 + 下单                                   |
+//+------------------------------------------------------------------+
+void CheckEntrySignals()
+{
+    if(CountMyPositions() >= MaxPositions) return;
+
+    // 1M已完成K线数据
+    double o1 = iOpen(_Symbol,  TF_Entry, 1);
+    double h1 = iHigh(_Symbol,  TF_Entry, 1);
+    double l1 = iLow(_Symbol,   TF_Entry, 1);
+    double c1 = iClose(_Symbol, TF_Entry, 1);
+    // 前一根
+    double o2 = iOpen(_Symbol,  TF_Entry, 2);
+    double h2 = iHigh(_Symbol,  TF_Entry, 2);
+    double l2 = iLow(_Symbol,   TF_Entry, 2);
+    double c2 = iClose(_Symbol, TF_Entry, 2);
+
+    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase != BRR_RETESTED) continue;
+        if(CountMyPositions() >= MaxPositions) break;
+
+        double lvl    = g_brrStates[i].levelPrice;
+        bool   isLong = g_brrStates[i].isLong;
+
+        bool signal = false;
+        if(isLong)
+            signal = IsBullishSignal(o1, h1, l1, c1, o2, h2, l2, c2, lvl);
+        else
+            signal = IsBearishSignal(o1, h1, l1, c1, o2, h2, l2, c2, lvl);
+
+        if(!signal) continue;
+
+        // 价格结构过滤 (可选)
+        if(UseStructureFilter) {
+            if(isLong  && !IsBullishStructure()) continue;
+            if(!isLong && !IsBearishStructure()) continue;
+        }
+
+        // 计算SL/TP
+        double slBuf = SL_BufferPips * g_pip;
+        double sl, tp, entry;
+
+        if(isLong) {
+            entry = ask;
+            sl    = lvl - slBuf;
+            double slDist = entry - sl;
+            if(slDist <= 0) continue;
+            tp = entry + slDist * RR_Ratio;
+        } else {
+            entry = bid;
+            sl    = lvl + slBuf;
+            double slDist = sl - entry;
+            if(slDist <= 0) continue;
+            tp = entry - slDist * RR_Ratio;
+        }
+
+        double lots = CalcLots(entry, sl);
+        if(lots <= 0) continue;
+
+        bool ok = false;
+        if(isLong)
+            ok = g_trade.Buy(lots, _Symbol, entry, sl, tp, "BRR多");
+        else
+            ok = g_trade.Sell(lots, _Symbol, entry, sl, tp, "BRR空");
+
+        if(ok) {
+            PrintFormat("✓ BRR%s入场 | 级别:%.5f | 入:%.5f SL:%.5f TP:%.5f | 手:%.2f",
+                        isLong ? "多" : "空", lvl, entry, sl, tp, lots);
+            if(ShowBRRLabels) DrawBRRLabel(i, lvl, isLong, "E");
+            g_brrStates[i].phase = BRR_IDLE;
+            DeleteLabel(i);
+        } else {
+            PrintFormat("× 下单失败 | 错误:%d", GetLastError());
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//|              反转K线形态识别                                        |
+//+------------------------------------------------------------------+
+
+// 看涨反转: 锤子线 / 看涨吞没 / 看涨针形
+bool IsBullishSignal(double o1, double h1, double l1, double c1,
+                     double o2, double h2, double l2, double c2, double lvl)
+{
+    double minBody = Reversal_MinBodyPips * g_pip;
+
+    // 1. 锤子线 (Hammer): 下影长 ≥ 实体2倍, 上影 ≤ 实体, 收盘为阳线
+    double body1       = MathAbs(c1 - o1);
+    double lowerShdw1  = MathMin(o1, c1) - l1;
+    double upperShdw1  = h1 - MathMax(o1, c1);
+    bool   isHammer    = (c1 > o1) &&                        // 阳线
+                         (body1 >= minBody) &&
+                         (lowerShdw1 >= 2.0 * body1) &&
+                         (upperShdw1 <= 0.5 * body1);
+
+    // 2. 看涨吞没 (Bullish Engulfing)
+    bool   isEngulf    = (c2 < o2) &&                        // 前阴线
+                         (c1 > o1) &&                        // 当前阳线
+                         (o1 <= c2) && (c1 >= o2) &&
+                         (c1 - o1 >= minBody);
+
+    // 3. 针形Bar (Pin Bar): 下影 ≥ 整根K线60%, 实体在上1/3
+    double range1 = h1 - l1;
+    bool   isPinBar = (range1 > 0) &&
+                      (lowerShdw1 / range1 >= 0.60) &&
+                      (MathMin(o1, c1) >= l1 + range1 * 0.60);
+
+    return (isHammer || isEngulf || isPinBar);
+}
+
+// 看跌反转: 射击之星 / 看跌吞没 / 看跌针形
+bool IsBearishSignal(double o1, double h1, double l1, double c1,
+                     double o2, double h2, double l2, double c2, double lvl)
+{
+    double minBody = Reversal_MinBodyPips * g_pip;
+
+    // 1. 射击之星 (Shooting Star)
+    double body1       = MathAbs(c1 - o1);
+    double upperShdw1  = h1 - MathMax(o1, c1);
+    double lowerShdw1  = MathMin(o1, c1) - l1;
+    bool   isStar      = (c1 < o1) &&
+                         (body1 >= minBody) &&
+                         (upperShdw1 >= 2.0 * body1) &&
+                         (lowerShdw1 <= 0.5 * body1);
+
+    // 2. 看跌吞没 (Bearish Engulfing)
+    bool   isEngulf    = (c2 > o2) &&
+                         (c1 < o1) &&
+                         (o1 >= c2) && (c1 <= o2) &&
+                         (o1 - c1 >= minBody);
+
+    // 3. 看跌针形
+    double range1 = h1 - l1;
+    bool   isPinBar = (range1 > 0) &&
+                      (upperShdw1 / range1 >= 0.60) &&
+                      (MathMax(o1, c1) <= h1 - range1 * 0.60);
+
+    return (isStar || isEngulf || isPinBar);
+}
+
+//+------------------------------------------------------------------+
+//|              5M价格结构过滤                                         |
+//+------------------------------------------------------------------+
+bool IsBullishStructure()
+{
+    // 近期5M: 高点抬升(HH) + 低点抬升(HL)
+    // 用近10根的最高高点 vs 远10根的最高高点
+    double highs[], lows[];
+    ArraySetAsSeries(highs, true);
+    ArraySetAsSeries(lows, true);
+    if(CopyHigh(_Symbol, TF_Trend, 1, 20, highs) < 20) return false;
+    if(CopyLow(_Symbol,  TF_Trend, 1, 20, lows)  < 20) return false;
+
+    double recentHigh = highs[ArrayMaximum(highs, 0, 10)];
+    double oldHigh    = highs[ArrayMaximum(highs, 10, 10)];
+    double recentLow  = lows[ArrayMinimum(lows,  0, 10)];
+    double oldLow     = lows[ArrayMinimum(lows,  10, 10)];
+
+    return (recentHigh > oldHigh && recentLow > oldLow);
+}
+
+bool IsBearishStructure()
+{
+    double highs[], lows[];
+    ArraySetAsSeries(highs, true);
+    ArraySetAsSeries(lows, true);
+    if(CopyHigh(_Symbol, TF_Trend, 1, 20, highs) < 20) return false;
+    if(CopyLow(_Symbol,  TF_Trend, 1, 20, lows)  < 20) return false;
+
+    double recentHigh = highs[ArrayMaximum(highs, 0, 10)];
+    double oldHigh    = highs[ArrayMaximum(highs, 10, 10)];
+    double recentLow  = lows[ArrayMinimum(lows,  0, 10)];
+    double oldLow     = lows[ArrayMinimum(lows,  10, 10)];
+
+    return (recentHigh < oldHigh && recentLow < oldLow);
+}
+
+//+------------------------------------------------------------------+
+//|              持仓管理: 盈亏平衡 + 追踪止损                          |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(!g_pos.SelectByIndex(i)) continue;
+        if(g_pos.Symbol() != _Symbol) continue;
+        if(g_pos.Magic() != MagicNumber) continue;
+
+        double open = g_pos.PriceOpen();
+        double sl   = g_pos.StopLoss();
+        double tp   = g_pos.TakeProfit();
+        ulong  tk   = g_pos.Ticket();
+        double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+        if(g_pos.PositionType() == POSITION_TYPE_BUY) {
+            double profit = bid - open;
+            double newSL  = sl;
+
+            if(UseBreakeven && profit >= BreakevenTriggerPips * g_pip && sl < open)
+                newSL = MathMax(newSL, open + g_pip);
+
+            if(UseTrailingStop && profit >= TrailStartPips * g_pip) {
+                double trailSL = bid - TrailDistPips * g_pip;
+                if(trailSL > newSL) newSL = trailSL;
+            }
+
+            if(newSL > sl + g_point)
+                g_trade.PositionModify(tk, newSL, tp);
+
+        } else { // SELL
+            double profit = open - ask;
+            double newSL  = sl;
+
+            if(UseBreakeven && profit >= BreakevenTriggerPips * g_pip && sl > open)
+                newSL = MathMin(newSL, open - g_pip);
+
+            if(UseTrailingStop && profit >= TrailStartPips * g_pip) {
+                double trailSL = ask + TrailDistPips * g_pip;
+                if(sl == 0 || trailSL < newSL) newSL = trailSL;
+            }
+
+            if(sl == 0 || newSL < sl - g_point)
+                g_trade.PositionModify(tk, newSL, tp);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//|              资金管理                                               |
+//+------------------------------------------------------------------+
+double CalcLots(double entry, double sl)
+{
+    double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskMoney = balance * RiskPercent / 100.0;
+    double slDist    = MathAbs(entry - sl);
+    if(slDist < g_point) return 0;
+
+    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double lots     = riskMoney / (slDist / tickSize * tickVal);
+
+    double minL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxL  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double stepL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+    lots = MathFloor(lots / stepL) * stepL;
+    return MathMax(minL, MathMin(maxL, lots));
+}
+
+//+------------------------------------------------------------------+
+int CountMyPositions()
+{
+    int cnt = 0;
+    for(int i = PositionsTotal() - 1; i >= 0; i--) {
+        if(g_pos.SelectByIndex(i) &&
+           g_pos.Symbol() == _Symbol &&
+           g_pos.Magic() == MagicNumber) cnt++;
+    }
+    return cnt;
+}
+
+bool IsInTradingHours()
+{
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    return (dt.hour >= TradingStartHour && dt.hour < TradingEndHour);
+}
+
+//+------------------------------------------------------------------+
+//|              图表可视化                                             |
+//+------------------------------------------------------------------+
+void DrawSRLines()
+{
+    if(!ShowSRLines) return;
+    for(int i = 0; i < g_srCount; i++) {
+        string name = g_srLevels[i].objName;
+        double lvl  = g_srLevels[i].price;
+        color  clr  = g_srLevels[i].isBroken ? ColorBroken :
+                      (g_srLevels[i].isResistance ? ColorResistance : ColorSupport);
+        int    style = g_srLevels[i].isBroken ? STYLE_DOT : STYLE_SOLID;
+        int    width = g_srLevels[i].isBroken ? 1 : 2;
+
+        if(ObjectFind(0, name) < 0)
+            ObjectCreate(0, name, OBJ_HLINE, 0, 0, lvl);
+        ObjectSetDouble(0, name, OBJPROP_PRICE, lvl);
+        ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+        ObjectSetInteger(0, name, OBJPROP_STYLE, style);
+        ObjectSetInteger(0, name, OBJPROP_WIDTH, width);
+        ObjectSetString(0, name, OBJPROP_TOOLTIP,
+            StringFormat("%s %.5f%s",
+                g_srLevels[i].isResistance ? "阻力" : "支撑", lvl,
+                g_srLevels[i].isBroken ? " [已突破]" : ""));
+    }
+}
+
+void DrawBRRLabel(int idx, double lvl, bool isLong, string tag)
+{
+    if(!ShowBRRLabels) return;
+    string name = g_brrStates[idx].labelName + "_" + tag;
+    if(ObjectFind(0, name) >= 0) ObjectDelete(0, name);
+    ObjectCreate(0, name, OBJ_ARROW_LABEL, 0, TimeCurrent(), lvl);
+    ObjectSetInteger(0, name, OBJPROP_ARROWCODE, isLong ? 233 : 234);
+    ObjectSetInteger(0, name, OBJPROP_COLOR, isLong ? ColorSupport : ColorResistance);
+    ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+    ObjectSetString(0, name, OBJPROP_TOOLTIP,
+        StringFormat("BRR%s | %.5f | %s", isLong ? "多" : "空", lvl, tag));
+}
+
+void DeleteLabel(int idx)
+{
+    string base = g_brrStates[idx].labelName;
+    ObjectDelete(0, base + "_R");
+    ObjectDelete(0, base + "_E");
+}
+
+//+------------------------------------------------------------------+
+//|              信息面板 (OnChartEvent 刷新)                           |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam,
+                  const double &dparam, const string &sparam)
+{
+    if(id == CHARTEVENT_CHART_CHANGE) DrawDashboard();
+}
+
+void DrawDashboard()
+{
+    string panel = "BRR_PANEL";
+    if(ObjectFind(0, panel) < 0)
+        ObjectCreate(0, panel, OBJ_LABEL, 0, 0, 0);
+    ObjectSetInteger(0, panel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+    ObjectSetInteger(0, panel, OBJPROP_XDISTANCE, 10);
+    ObjectSetInteger(0, panel, OBJPROP_YDISTANCE, 20);
+    ObjectSetInteger(0, panel, OBJPROP_FONTSIZE, 9);
+    ObjectSetInteger(0, panel, OBJPROP_COLOR, clrWhite);
+
+    // 统计活跃BRR状态
+    int waiting = 0, retested = 0;
+    for(int i = 0; i < MAX_BRR_STATES; i++) {
+        if(g_brrStates[i].phase == BRR_WAITING)  waiting++;
+        if(g_brrStates[i].phase == BRR_RETESTED) retested++;
+    }
+
+    string emaDir = "---";
+    if(UseEMAFilter && ArraySize(g_emaFast) > 0 && ArraySize(g_emaSlow) > 0)
+        emaDir = (g_emaFast[0] > g_emaSlow[0]) ? "↑ 多头" : "↓ 空头";
+
+    string info = StringFormat(
+        "BRR多周期共振 | %s\n"
+        "S/R级别: %d  |  突破等待: %d  |  已回测: %d\n"
+        "5M趋势(EMA): %s  |  持仓: %d/%d",
+        _Symbol, g_srCount, waiting, retested,
+        emaDir, CountMyPositions(), MaxPositions);
+
+    ObjectSetString(0, panel, OBJPROP_TEXT, info);
+}
+//+------------------------------------------------------------------+
